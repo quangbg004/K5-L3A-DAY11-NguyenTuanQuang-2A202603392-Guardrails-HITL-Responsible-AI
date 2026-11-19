@@ -5,30 +5,55 @@ Checkpoint 2 — Output Guardrails
   - LLM-as-Judge                          ← optional (không chấm)
 """
 import re
-import textwrap
 
 from google.genai import types
-from google.adk.agents import llm_agent
 from google.adk import runners
 from google.adk.plugins import base_plugin
 
+from agents.security_boundary import normalize_for_security
+from core.config import load_protected_payload
+from core.openai_runtime import OpenAIInvocationContext
 from core.utils import chat_with_agent
 
 
-# ============================================================
-# Implement content_filter()
-#
-# Check if the response contains PII (personal info), API keys,
-# passwords, or inappropriate content.
-#
-# Return a dict with:
-# - "safe": True/False
-# - "issues": list of problems found
-# - "redacted": cleaned response (PII replaced with [REDACTED])
-# ============================================================
+_REDACTION = "[REDACTED]"
+_CONTENT_PATTERNS = {
+    "phone": r"(?<!\w)(?:0[35789](?:[ .-]?\d){8}|0[12](?:[ .-]?\d){9}|(?:\+84|0084)[ .-]?(?:[35789](?:[ .-]?\d){8}|2(?:[ .-]?\d){9}))(?!\w)",
+    "email": r"[\w.+%!-]+@[a-z0-9-]+(?:\.[a-z0-9-]+)*\.[a-z]{2,}\b",
+    "national_id": r"(?<!\w)(?:\d{12}|\d{9})(?!\w)",
+    "api_key": r"(?<!\w)sk-[a-z0-9_-]+",
+    "password": (
+        r"(?:\b(?:password|mật\s+khẩu)\b\**[ \t]*"
+        r"(?:[:=][ \t]*|\b(?:is|là)\b[ \t]+"
+        r"(?!(?:required|incorrect|invalid|expired|case-sensitive|mandatory|not|too|already)\b))"
+        r"\**[ \t]*)"
+        r'''(?P<value>"[^"\r\n]+"|'[^'\r\n]+'|`[^`\r\n]+`|(?!\[REDACTED\])'''
+        r"[^\s<>`'\"*]+(?<![.,;:]))"
+    ),
+}
+
+
+def _build_filters() -> dict[str, re.Pattern[str]]:
+    patterns = _CONTENT_PATTERNS.copy()
+    secret_types = {"admin_password": "password", "api_key": "api_key", "db_host": "internal_db"}
+    for target in load_protected_payload()["leak_targets"]:
+        kind = secret_types.get(target["id"], target["id"])
+        values = {target["value"], *target.get("match_substrings", [])}
+        values_by_length = sorted(filter(None, values), key=lambda value: (-len(value), value))
+        alternatives = "|".join(re.escape(value) for value in values_by_length)
+        if alternatives:
+            literal = rf"(?:{alternatives})"
+            if kind == "internal_db":
+                literal += r"(?::\d+)?"
+            patterns[kind] = "|".join(filter(None, (patterns.get(kind), literal)))
+    return {kind: re.compile(pattern, re.IGNORECASE) for kind, pattern in patterns.items()}
+
+
+_FILTERS = _build_filters()
+
 
 def content_filter(response: str) -> dict:
-    """Filter response for PII, secrets, and harmful content.
+    """Filter response for PII and credentials.
 
     Args:
         response: The LLM's response text
@@ -36,30 +61,27 @@ def content_filter(response: str) -> dict:
     Returns:
         dict with 'safe', 'issues', and 'redacted' keys
     """
+    canonical = normalize_for_security(response)
     issues = []
-    redacted = response
-
-    # PII patterns to check
-    PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
-    }
-
-    for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
+    spans = []
+    for name, pattern in _FILTERS.items():
+        matches = list(pattern.finditer(canonical))
         if matches:
             issues.append(f"{name}: {len(matches)} found")
-            redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+            spans.extend(match.span("value" if match.lastgroup == "value" else 0) for match in matches)
 
-    return {
-        "safe": len(issues) == 0,
-        "issues": issues,
-        "redacted": redacted,
-    }
+    if not spans:
+        return {"safe": True, "issues": [], "redacted": response}
+
+    # Collect matches before modifying the text so overlaps cannot hide another match.
+    chunks = []
+    end = 0
+    for start, stop in sorted(spans):
+        if start >= end:
+            chunks.extend((canonical[end:start], _REDACTION))
+        end = max(end, stop)
+    chunks.append(canonical[end:])
+    return {"safe": False, "issues": issues, "redacted": "".join(chunks)}
 
 
 # ============================================================
@@ -128,18 +150,6 @@ async def llm_safety_check(response_text: str) -> dict:
     return {"safe": is_safe, "verdict": verdict.strip()}
 
 
-# ============================================================
-# Implement OutputGuardrailPlugin
-#
-# This plugin checks the agent's output BEFORE sending to the user.
-# Uses after_model_callback to intercept LLM responses.
-# Combines content_filter() and llm_safety_check().
-#
-# NOTE: after_model_callback uses keyword-only arguments.
-#   - llm_response has a .content attribute (types.Content)
-#   - Return the (possibly modified) llm_response, or None to keep original
-# ============================================================
-
 class OutputGuardrailPlugin(base_plugin.BasePlugin):
     """Plugin that checks agent output before sending to user."""
 
@@ -152,12 +162,9 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
 
     def _extract_text(self, llm_response) -> str:
         """Extract text from LLM response."""
-        text = ""
-        if hasattr(llm_response, "content") and llm_response.content:
-            for part in llm_response.content.parts:
-                if hasattr(part, "text") and part.text:
-                    text += part.text
-        return text
+        content = getattr(llm_response, "content", None)
+        parts = (content.parts or []) if content else []
+        return "".join(part.text for part in parts if part.text)
 
     async def after_model_callback(
         self,
@@ -170,18 +177,29 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
 
         response_text = self._extract_text(llm_response)
         if not response_text:
-            return llm_response
+            return None
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        result = content_filter(response_text)
+        text = result["redacted"]
+        judge_safe = True
+        if self.use_llm_judge:
+            if isinstance(callback_context, OpenAIInvocationContext):
+                callback_context.judge_checked = True
+            judge_safe = (await llm_safety_check(text))["safe"]
+        if not judge_safe:
+            if isinstance(callback_context, OpenAIInvocationContext):
+                callback_context.blocked_by = self.name
+            self.blocked_count += 1
+            text = "Response blocked by the output guardrail. How else can I help with VinBank?"
+        elif not result["safe"]:
+            self.redacted_count += 1
+        else:
+            return None
 
-        return llm_response  # TODO: modify if needed
+        llm_response.content = types.Content(
+            role="model", parts=[types.Part.from_text(text=text)]
+        )
+        return llm_response
 
 
 # ============================================================
@@ -205,10 +223,9 @@ def test_content_filter():
     for resp in test_responses:
         result = content_filter(resp)
         status = "SAFE" if result["safe"] else "ISSUES FOUND"
-        print(f"  [{status}] '{resp[:60]}...'")
+        print(f"  [{status}] {result['redacted']}")
         if result["issues"]:
             print(f"           Issues: {result['issues']}")
-            print(f"           Redacted: {result['redacted'][:80]}...")
 
 
 def load_lab_pii_dataset():

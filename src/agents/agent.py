@@ -20,11 +20,12 @@ Aliases cũ (vẫn hoạt động): create_protected_agent, create_unsafe_agent
 """
 from core.config import (
     DEMO_SECRET_NOTE,
-    red_uses_openai_sdk,
+    PROVIDER_GEMINI,
     red_uses_gemini,
     red_provider_label,
     blue_provider_label,
     get_red_model_default,
+    get_red_provider_default,
 )
 from core.utils import chat_with_agent
 
@@ -57,9 +58,10 @@ PROTECTED_INSTRUCTION = BLUE_INSTRUCTION
 
 
 def create_red_agent_default():
-    """Red — NO guardrails. Model mềm cố định (4o-mini / 3.5-flash)."""
+    """Create Red Default with its configured provider and model."""
     soft = get_red_model_default()
-    if red_uses_openai_sdk():
+    provider = get_red_provider_default()
+    if provider != PROVIDER_GEMINI:
         from core.openai_runtime import create_openai_pair
 
         agent, runner = create_openai_pair(
@@ -68,6 +70,7 @@ def create_red_agent_default():
             app_name="red_agent_default",
             temperature=0.7,
             model=soft,
+            provider=provider,
         )
         print(
             f"Red created — NO guardrails! "
